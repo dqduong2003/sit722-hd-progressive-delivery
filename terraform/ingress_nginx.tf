@@ -67,6 +67,16 @@ resource "helm_release" "ingress_nginx" {
       value = "prometheus"
     },
 
+    # The scrape target carries its own `namespace="ingress-nginx"` label. By
+    # default Prometheus resolves that clash by renaming the metric's label
+    # to `exported_namespace`, so `namespace="production"` matches nothing
+    # and the rollback gate fails closed with "no request-rate data".
+    # honorLabels keeps the metric's own namespace.
+    {
+      name  = "controller.metrics.serviceMonitor.honorLabels"
+      value = "true"
+    },
+
     # The chart default is 30s. The rollback gate evaluates rate(...[2m]),
     # which at 30s yields only four samples - a single missed scrape can
     # produce NaN and make a healthy-looking result out of no data. 15s
