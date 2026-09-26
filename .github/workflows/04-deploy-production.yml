@@ -1,0 +1,152 @@
+name: 04 - Deploy to Production
+
+# Continuous Deployment: production is promoted automatically once staging
+# has been deployed and smoke-tested successfully, with no manual trigger.
+# The exact commit SHA that passed "03 - Test Staging" is reused as the
+# image tag, so production always runs precisely what staging just proved.
+on:
+  workflow_run:
+    workflows:
+      - "03 - Test Staging"
+    types:
+      - completed
+    branches:
+      - main
+
+jobs:
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+
+    if: >
+      ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # Certificate-based admin kubeconfig from a repository secret
+      # (a student Entra tenant blocks the service principal `azure/login` needs).
+      - name: Configure kubectl (admin kubeconfig)
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl config current-context
+
+      - name: Create production namespace
+        run: |
+          kubectl create namespace production \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Create PostgreSQL secret
+        run: |
+          kubectl create secret generic postgres-secret \
+            --namespace production \
+            --from-literal=POSTGRES_USER="${{ secrets.POSTGRES_USER }}" \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Create application secret
+        run: |
+          kubectl create secret generic application-secret \
+            --namespace production \
+            --from-literal=POSTGRES_USER="${{ secrets.POSTGRES_USER }}" \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
+            --from-literal=JWT_SECRET_KEY="${{ secrets.JWT_SECRET_KEY }}" \
+            --from-literal=DEFAULT_ADMIN_USERNAME="${{ secrets.DEFAULT_ADMIN_USERNAME }}" \
+            --from-literal=DEFAULT_ADMIN_EMAIL="${{ secrets.DEFAULT_ADMIN_EMAIL }}" \
+            --from-literal=DEFAULT_ADMIN_PASSWORD="${{ secrets.DEFAULT_ADMIN_PASSWORD }}" \
+            --from-literal=AZURE_STORAGE_CONNECTION_STRING="${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply \
+            -f kubernetes/production/
+
+      - name: Update frontend image
+        run: |
+          kubectl set image deployment/frontend \
+            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ github.event.workflow_run.head_sha }} \
+            -n production
+
+      - name: Update user-service image
+        run: |
+          kubectl set image deployment/user-service \
+            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ github.event.workflow_run.head_sha }} \
+            -n production
+
+      - name: Update student-service image
+        run: |
+          kubectl set image deployment/student-service \
+            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:${{ github.event.workflow_run.head_sha }} \
+            -n production
+
+      - name: Update lecturer-service image
+        run: |
+          kubectl set image deployment/lecturer-service \
+            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:${{ github.event.workflow_run.head_sha }} \
+            -n production
+
+      - name: Update course-service image
+        run: |
+          kubectl set image deployment/course-service \
+            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:${{ github.event.workflow_run.head_sha }} \
+            -n production
+
+      - name: Update enrollment-service image
+        run: |
+          kubectl set image deployment/enrollment-service \
+            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ github.event.workflow_run.head_sha }} \
+            -n production
+
+      - name: Wait for frontend rollout
+        run: |
+          kubectl rollout status deployment/frontend \
+            -n production \
+            --timeout=300s
+
+      - name: Wait for user-service rollout
+        run: |
+          kubectl rollout status deployment/user-service \
+            -n production \
+            --timeout=300s
+
+      - name: Wait for student-service rollout
+        run: |
+          kubectl rollout status deployment/student-service \
+            -n production \
+            --timeout=300s
+
+      - name: Wait for lecturer-service rollout
+        run: |
+          kubectl rollout status deployment/lecturer-service \
+            -n production \
+            --timeout=300s
+
+      - name: Wait for course-service rollout
+        run: |
+          kubectl rollout status deployment/course-service \
+            -n production \
+            --timeout=300s
+
+      - name: Wait for enrollment-service rollout
+        run: |
+          kubectl rollout status deployment/enrollment-service \
+            -n production \
+            --timeout=300s
+
+      - name: Show production resources
+        run: |
+          kubectl get pods -n production
+          kubectl get services -n production
+          kubectl get pvc -n production

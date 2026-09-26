@@ -1,0 +1,63 @@
+name: 06 - Deploy Monitoring (Prometheus & Grafana)
+
+# Deploys the kube-prometheus-stack (Prometheus + Alertmanager + Grafana +
+# node-exporter + kube-state-metrics) onto the AKS cluster via Helm.
+#
+# This is deliberately its own manually-triggered workflow, not a step
+# inside 02/04: monitoring is cluster-level, install-once infrastructure
+# that watches every namespace (staging AND production) at once. Wiring it
+# into every app deployment would reinstall/upgrade it on every push for no
+# reason and risks disrupting an already-running Prometheus/Grafana.
+# `helm upgrade --install` is idempotent, so re-running this workflow later
+# (e.g. for a chart version bump) is safe.
+#
+# Auth: reuses the existing KUBE_CONFIG repository secret (the same
+# certificate-based admin kubeconfig used by 02/03/04) - no new Azure
+# credentials are needed for this stage.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-monitoring:
+    name: Install kube-prometheus-stack
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure kubectl (admin kubeconfig)
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl config current-context
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "latest"
+
+      - name: Add and update the Prometheus community Helm repo
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      - name: Install or upgrade kube-prometheus-stack
+        run: |
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --create-namespace \
+            --wait \
+            --timeout 10m0s
+
+      - name: Verify monitoring pods are healthy
+        run: |
+          kubectl get pods -n monitoring
+          kubectl get svc -n monitoring
+          kubectl rollout status deployment/prometheus-grafana -n monitoring --timeout=300s
+          kubectl rollout status statefulset/prometheus-prometheus-kube-prometheus-prometheus -n monitoring --timeout=300s
+
+      - name: Confirm the application is still reachable
+        run: |
+          FRONTEND_IP=$(kubectl get service frontend -n staging -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "Staging frontend IP: $FRONTEND_IP"
+          curl --fail --retry 5 --retry-delay 5 "http://$FRONTEND_IP"

@@ -1,0 +1,206 @@
+name: 01 - CI
+
+on:
+  # Trigger the workflow on push to main branch
+  push:
+    branches:
+      - main
+
+  # Manual trigger for the workflow
+  workflow_dispatch:
+
+
+jobs:
+
+  # =========================================================
+  # Backend Tests
+  # =========================================================
+  backend-test:
+    name: Test ${{ matrix.service }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - service: user-service
+            database: users
+            port: 5433
+
+          - service: student-service
+            database: students
+            port: 5434
+
+          - service: lecturer-service
+            database: lecturers
+            port: 5435
+
+          - service: course-service
+            database: courses
+            port: 5436
+
+          - service: enrollment-service
+            database: enrollments
+            port: 5437
+
+    services:
+      postgres:
+        image: postgres:16
+
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ matrix.database }}
+
+        ports:
+          - ${{ matrix.port }}:5432
+
+        options: >-
+          --health-cmd="pg_isready -U postgres -d ${{ matrix.database }}"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${{ matrix.database }}
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: ${{ matrix.port }}
+
+      JWT_SECRET_KEY: koalatech-ci-test-secret
+      JWT_ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 30
+
+      DEFAULT_ADMIN_USERNAME: admin
+      DEFAULT_ADMIN_EMAIL: admin@koalatech.edu.au
+      DEFAULT_ADMIN_PASSWORD: AdminPassword123!
+
+      AZURE_STORAGE_CONNECTION_STRING: ""
+      AZURE_STORAGE_CONTAINER_NAME: ""
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.service }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        working-directory: ${{ matrix.service }}
+        run: |
+          pytest -v
+
+
+  # =========================================================
+  # Build and Push Docker Images
+  # =========================================================
+  build-and-push:
+    name: Build and Push ${{ matrix.image }}
+    runs-on: ubuntu-latest
+
+    # All backend tests must pass before this job starts
+    needs:
+      - backend-test
+
+    # Build and push when code is pushed to main or manually triggered
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - service: frontend
+            image: koalatech-frontend
+
+          - service: user-service
+            image: koalatech-user-service
+
+          - service: student-service
+            image: koalatech-student-service
+
+          - service: lecturer-service
+            image: koalatech-lecturer-service
+
+          - service: course-service
+            image: koalatech-course-service
+
+          - service: enrollment-service
+            image: koalatech-enrollment-service
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # A student Microsoft Entra tenant blocks service-principal creation, so
+      # instead of `azure/login` + `az acr login` we authenticate to ACR with
+      # its admin username/password (stored as repository secrets).
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ vars.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -t ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }} \
+            ./${{ matrix.service }}
+
+      # Docker Scout evaluates via Docker Hub's backend regardless of which
+      # registry hosts the image, so it needs its own Docker Hub login,
+      # separate from the ACR login above.
+      - name: Login to Docker Hub (for Docker Scout)
+        uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Security gate between build and push: a new, fixable Critical/High
+      # CVE introduced by this application layer fails the job here, before
+      # the image ever reaches ACR or a deployment could pull it.
+      #
+      # ignore-base: true  - don't gate on advisories that exist unchanged
+      #   in the upstream base image (e.g. Debian OS packages with no
+      #   patched version available yet) - the app team can't fix those by
+      #   changing this repo, and the base image is already confirmed
+      #   current (see Task 10.1P's `docker scout recommendations`).
+      # only-fixed: true   - don't gate on any advisory with no available
+      #   fix at all, app-layer or not - blocking forever on something
+      #   nobody can patch isn't a useful gate.
+      - name: Analyze image with Docker Scout
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+          exit-code: true
+          only-severities: critical,high
+          ignore-base: true
+          only-fixed: true
+
+      - name: Evaluate Docker Scout policies
+        uses: docker/scout-action@v1
+        with:
+          command: policy
+          image: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+          organization: ${{ secrets.DOCKERHUB_USERNAME }}
+
+      - name: Push Docker image with commit SHA
+        run: |
+          docker push \
+            ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}

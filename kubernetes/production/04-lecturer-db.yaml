@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lecturer-db-pvc
+  namespace: production
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lecturer-db
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lecturer-db
+  template:
+    metadata:
+      labels:
+        app: lecturer-db
+    spec:
+      containers:
+        - name: lecturer-db
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: lecturers
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: lecturer-db-storage
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: lecturer-db-storage
+          persistentVolumeClaim:
+            claimName: lecturer-db-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lecturer-db
+  namespace: production
+spec:
+  selector:
+    app: lecturer-db
+  ports:
+    - port: 5432
+      targetPort: 5432

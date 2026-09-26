@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: course-db-pvc
+  namespace: production
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: course-db
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: course-db
+  template:
+    metadata:
+      labels:
+        app: course-db
+    spec:
+      containers:
+        - name: course-db
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: courses
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: course-db-storage
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: course-db-storage
+          persistentVolumeClaim:
+            claimName: course-db-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: course-db
+  namespace: production
+spec:
+  selector:
+    app: course-db
+  ports:
+    - port: 5432
+      targetPort: 5432

@@ -1,0 +1,244 @@
+services:
+  frontend:
+    platform: linux/amd64
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: koalatech-frontend:v1
+    container_name: koalatech-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      user-service:
+        condition: service_started
+      student-service:
+        condition: service_started
+      lecturer-service:
+        condition: service_started
+      course-service:
+        condition: service_started
+      enrollment-service:
+        condition: service_started
+    networks:
+      - koalatech-network
+
+  user-service:
+    platform: linux/amd64
+    build:
+      context: ./user-service
+      dockerfile: Dockerfile
+    image: koalatech-user-service:v1
+    container_name: user-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./user-service/.env
+    depends_on:
+      user-db:
+        condition: service_healthy
+    networks:
+      - koalatech-network
+
+  user-db:
+    image: postgres:16-alpine
+    container_name: user-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: users
+    ports:
+      - "5433:5432"
+    volumes:
+      - user-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U postgres -d users"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - koalatech-network
+
+  student-service:
+    platform: linux/amd64
+    build:
+      context: ./student-service
+      dockerfile: Dockerfile
+    image: koalatech-student-service:v1
+    container_name: student-service
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    env_file:
+      - ./student-service/.env
+    depends_on:
+      student-db:
+        condition: service_healthy
+    networks:
+      - koalatech-network
+
+  student-db:
+    image: postgres:16-alpine
+    container_name: student-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: students
+    ports:
+      - "5434:5432"
+    volumes:
+      - student-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U postgres -d students"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - koalatech-network
+
+  lecturer-service:
+    platform: linux/amd64
+    build:
+      context: ./lecturer-service
+      dockerfile: Dockerfile
+    image: koalatech-lecturer-service:v1
+    container_name: lecturer-service
+    restart: unless-stopped
+    ports:
+      - "8002:8000"
+    env_file:
+      - ./lecturer-service/.env
+    depends_on:
+      lecturer-db:
+        condition: service_healthy
+    networks:
+      - koalatech-network
+
+  lecturer-db:
+    image: postgres:16-alpine
+    container_name: lecturer-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: lecturers
+    ports:
+      - "5435:5432"
+    volumes:
+      - lecturer-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U postgres -d lecturers"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - koalatech-network
+
+  course-service:
+    platform: linux/amd64
+    build:
+      context: ./course-service
+      dockerfile: Dockerfile
+    image: koalatech-course-service:v1
+    container_name: course-service
+    restart: unless-stopped
+    ports:
+      - "8003:8000"
+    env_file:
+      - ./course-service/.env
+    depends_on:
+      course-db:
+        condition: service_healthy
+    networks:
+      - koalatech-network
+
+  course-db:
+    image: postgres:16-alpine
+    container_name: course-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: courses
+    ports:
+      - "5436:5432"
+    volumes:
+      - course-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U postgres -d courses"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - koalatech-network
+
+  enrollment-service:
+    platform: linux/amd64
+    build:
+      context: ./enrollment-service
+      dockerfile: Dockerfile
+    image: koalatech-enrollment-service:v1
+    container_name: enrollment-service
+    restart: unless-stopped
+    ports:
+      - "8004:8000"
+    env_file:
+      - ./enrollment-service/.env
+    depends_on:
+      enrollment-db:
+        condition: service_healthy
+    networks:
+      - koalatech-network
+
+  enrollment-db:
+    image: postgres:16-alpine
+    container_name: enrollment-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: enrollments
+    ports:
+      - "5437:5432"
+    volumes:
+      - enrollment-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U postgres -d enrollments"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - koalatech-network
+
+networks:
+  koalatech-network:
+    driver: bridge
+
+volumes:
+  user-db-data:
+  student-db-data:
+  lecturer-db-data:
+  course-db-data:
+  enrollment-db-data:

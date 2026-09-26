@@ -1,0 +1,25 @@
+# Copy this file to terraform.tfvars and adjust the values.
+# terraform.tfvars is git-ignored (see .gitignore) - do not commit real values.
+
+location = "Australia East"
+
+resource_group_name = "sit722-week10-2d"
+
+# ACR name: 5-50 characters, alphanumeric only, GLOBALLY unique
+acr_name = "s225757776week102d"
+
+# Storage account name: 3-24 characters, lowercase letters and digits only, GLOBALLY unique
+storage_account_name = "s225757776week102dsa"
+
+aks_cluster_name = "aks-sit722-week10-2d"
+aks_dns_prefix   = "sit722week102d"
+
+# Three nodes: staging + production PostgreSQL workloads, plus the
+# kube-prometheus-stack monitoring pods added for Task 10.2D.
+aks_node_count = 3
+
+# Standard_D2s_v3 is the default. Standard_B2ms (burstable, ~half the cost)
+# also works for this practical if you want to reduce spend:
+# aks_node_vm_size = "Standard_B2ms"
+
+environment = "development"

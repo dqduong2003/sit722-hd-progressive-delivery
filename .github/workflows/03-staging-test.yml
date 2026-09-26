@@ -1,0 +1,60 @@
+name: 03 - Test Staging
+
+on:
+  workflow_run:
+    workflows:
+      - "02 - Deploy to Staging"
+    types:
+      - completed
+    branches:
+      - main
+
+jobs:
+  smoke-test:
+    name: Staging Smoke Test
+    runs-on: ubuntu-latest
+
+    if: >
+      ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    environment:
+      name: staging
+
+    steps:
+      # Certificate-based admin kubeconfig from a repository secret
+      # (a student Entra tenant blocks the service principal `azure/login` needs).
+      - name: Configure kubectl (admin kubeconfig)
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl config current-context
+
+      - name: Wait for staging frontend IP
+        run: |
+          for i in {1..30}; do
+
+            FRONTEND_IP=$(kubectl get service frontend \
+              -n staging \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+            if [ -n "$FRONTEND_IP" ]; then
+              echo "FRONTEND_IP=$FRONTEND_IP" >> "$GITHUB_ENV"
+              exit 0
+            fi
+
+            echo "Waiting for staging frontend IP..."
+
+            sleep 10
+          done
+
+          echo "Unable to find staging frontend IP."
+          exit 1
+
+      - name: Test frontend
+        run: |
+          curl \
+            --fail \
+            --retry 10 \
+            --retry-delay 5 \
+            http://${{ env.FRONTEND_IP }}
