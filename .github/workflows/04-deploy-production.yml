@@ -4,6 +4,21 @@ name: 04 - Deploy to Production
 # has been deployed and smoke-tested successfully, with no manual trigger.
 # The exact commit SHA that passed "03 - Test Staging" is reused as the
 # image tag, so production always runs precisely what staging just proved.
+#
+# HD task change: user-service is NO LONGER deployed by this workflow.
+#
+# Its release is owned by "07 - Progressive Deploy (Blue/Green)", which
+# deploys it to an idle slot, shifts traffic to it in weighted steps, and
+# rolls it back automatically if the live error rate rises. That workflow
+# needs exclusive control of the user-service Deployments and of the Service
+# selectors that decide which slot is live - a `kubectl set image` from here
+# would fight it, and `kubectl apply` of a placeholder image would break a
+# running release.
+#
+# The other five components keep the in-place rolling update they have had
+# since Week 08. That contrast is deliberate and is the point of comparison
+# in the accompanying documentation.
+#
 on:
   workflow_run:
     workflows:
@@ -79,12 +94,6 @@ jobs:
             frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ github.event.workflow_run.head_sha }} \
             -n production
 
-      - name: Update user-service image
-        run: |
-          kubectl set image deployment/user-service \
-            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ github.event.workflow_run.head_sha }} \
-            -n production
-
       - name: Update student-service image
         run: |
           kubectl set image deployment/student-service \
@@ -112,12 +121,6 @@ jobs:
       - name: Wait for frontend rollout
         run: |
           kubectl rollout status deployment/frontend \
-            -n production \
-            --timeout=300s
-
-      - name: Wait for user-service rollout
-        run: |
-          kubectl rollout status deployment/user-service \
             -n production \
             --timeout=300s
 

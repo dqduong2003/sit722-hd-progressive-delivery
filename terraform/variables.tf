@@ -85,3 +85,31 @@ variable "tags" {
     Practical = "Week08"
   }
 }
+
+#
+# HD task additions
+#
+
+variable "ingress_nginx_chart_version" {
+  description = <<-EOT
+    Pinned ingress-nginx Helm chart version. Pinned rather than floating
+    because the upstream project is archived and unpatched - the deployed
+    version must be a recorded decision, not whatever the repository serves
+    on the day of the apply.
+  EOT
+  type        = string
+  default     = "4.13.3"
+}
+
+variable "user_service_ingress_host" {
+  description = <<-EOT
+    Host name used by both the stable and canary Ingress objects for
+    user-service. ingress-nginx merges a canary Ingress into the stable
+    Ingress's server block by matching host AND path, and canary routing on
+    an empty host has never worked (ingress-nginx#3707) - traffic silently
+    goes 100% to stable. A fake host sent via an explicit Host header keeps
+    the demo free of any DNS dependency.
+  EOT
+  type        = string
+  default     = "koalatech.local"
+}

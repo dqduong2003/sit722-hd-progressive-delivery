@@ -1,0 +1,83 @@
+#
+# The traffic-management layer. This is the capability the course has not
+# covered: a Service load-balances evenly across every pod its selector
+# matches, so it can express "all of v1" or "all of v2" but never "10% of
+# v2". Weighted routing has to happen at a layer that understands HTTP.
+#
+# ingress-nginx implements a canary by MERGING the canary Ingress into the
+# stable Ingress's server block as an alternative upstream, choosing between
+# them per request according to canary-weight. Three consequences follow,
+# each of which is a silent failure if ignored:
+#
+#  1. Both Ingresses must declare the SAME host and path, or the merge never
+#     happens and every request goes to stable.
+#  2. The host must not be empty. Canary routing with no host has never
+#     worked upstream (ingress-nginx#3707) and fails silently. A fake host
+#     sent as an explicit Host header avoids any DNS dependency.
+#  3. A canary Ingress IGNORES all non-canary annotations and inherits them
+#     from the main Ingress. rewrite-target therefore belongs on the stable
+#     Ingress only; putting it here as well would be a no-op that reads as
+#     if it were doing something.
+#
+# `ingressClassName` is required on both: the chart does not install its
+# IngressClass as cluster default, and an Ingress with no class is ignored
+# with no error and no event.
+#
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: user-service
+  namespace: production
+  labels:
+    app: user-service
+    role: stable
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: koalatech.local
+      http:
+        paths:
+          - path: /api/users(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: user-service
+                port:
+                  number: 8000
+
+---
+#
+# The canary. `canary-weight` is the single value the pipeline moves
+# (0 -> 10 -> 50 -> 100) and resets to 0 both on promotion and on rollback.
+#
+# Rolling back means setting this to 0. It does NOT mean scaling the preview
+# slot to zero replicas: an alternative upstream with no ready endpoints
+# makes the controller log `no alternative balancer for backend`
+# (ingress-nginx#4612), so the preview Deployment always keeps >= 1 replica.
+#
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: user-service-canary
+  namespace: production
+  labels:
+    app: user-service
+    role: canary
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "0"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: koalatech.local
+      http:
+        paths:
+          - path: /api/users(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: user-service-preview
+                port:
+                  number: 8000

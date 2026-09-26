@@ -1,0 +1,69 @@
+#
+# Role-pinned Services: the indirection that makes blue/green repeatable.
+#
+# The obvious design points the stable Ingress straight at
+# `user-service-blue` and the canary Ingress at `user-service-green`. That
+# works exactly once. After green is promoted, green is live and blue
+# becomes the next deployment target - so the pipeline would have to rewrite
+# the Ingress backends on every release, which is the fragile, error-prone
+# editing that blue/green exists to avoid.
+#
+# Instead these two Services name a ROLE, not a slot:
+#
+#   user-service          -> whichever slot is currently live
+#   user-service-preview  -> whichever slot is the deployment target
+#
+# The Ingresses point at these names and are never modified. Promotion is
+# a swap of the two `slot` selector values, which is atomic per Service and
+# needs no Ingress change at all. The topology is symmetric, so blue->green
+# and green->blue are the same operation.
+#
+# The `slot` values below are the BOOTSTRAP state only. From then on the
+# pipeline owns them, which is why these Services are created once rather
+# than re-applied on every deployment - a blind `kubectl apply` would reset
+# the live slot back to blue and silently undo a promotion.
+#
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+  namespace: production
+  labels:
+    app: user-service
+    role: stable
+  annotations:
+    koalatech.edu.au/managed-by: progressive-deploy-pipeline
+    koalatech.edu.au/description: >-
+      Live traffic. The slot selector is patched by 07-progressive-deploy.yml
+      at promotion; do not re-apply this manifest over a running release.
+spec:
+  type: ClusterIP
+  selector:
+    app: user-service
+    slot: blue
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service-preview
+  namespace: production
+  labels:
+    app: user-service
+    role: preview
+  annotations:
+    koalatech.edu.au/managed-by: progressive-deploy-pipeline
+    koalatech.edu.au/description: >-
+      Canary target. Always points at the idle slot receiving the new
+      release. Must keep at least one ready endpoint even at canary-weight 0.
+spec:
+  type: ClusterIP
+  selector:
+    app: user-service
+    slot: green
+  ports:
+    - port: 8000
+      targetPort: 8000

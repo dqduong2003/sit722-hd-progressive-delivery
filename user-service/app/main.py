@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.db import Base, engine
+from app.fault_injection import register_fault_injection
 from app.models import User, UserRole
 from app.routers import auth, users
 from app.security import hash_password
@@ -115,6 +116,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+register_fault_injection(app)
 
 app.include_router(auth.router)
 app.include_router(users.router)

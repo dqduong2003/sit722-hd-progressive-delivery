@@ -1,0 +1,49 @@
+#
+# In-cluster load generator, started and stopped by the progressive-deploy
+# workflow so that traffic is flowing before the first canary weight is
+# applied and for the whole duration of the rollout.
+#
+# The script itself lives in k6/rollout-load.js and is loaded into the
+# `k6-rollout-script` ConfigMap by the workflow, so there is one copy of it
+# under version control rather than a duplicate embedded in YAML.
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-rollout-load
+  namespace: production
+  labels:
+    app: k6-rollout-load
+spec:
+  # A failed load generator must not be retried into a second concurrent
+  # generator part-way through a rollout.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: k6-rollout-load
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          args:
+            - run
+            - --no-thresholds
+            - /scripts/rollout-load.js
+          env:
+            - name: RPS
+              value: "20"
+            - name: DURATION
+              value: "12m"
+            - name: TARGET_URL
+              value: http://ingress-nginx-controller.ingress-nginx.svc.cluster.local/api/users/
+            - name: TARGET_HOST
+              value: koalatech.local
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+      volumes:
+        - name: script
+          configMap:
+            name: k6-rollout-script
