@@ -112,7 +112,12 @@ if awk -v a="${total_rps_raw}" -v b="${MIN_TOTAL_RPS}" 'BEGIN { exit !(a < b) }'
 fi
 
 # --------------------------------------------------------- canary ratio
-canary_query="sum(rate(nginx_ingress_controller_requests{${CANARY_SELECTOR},status=~\"5..\"}[${WINDOW}]))
+# The numerator is wrapped in `or vector(0)`: a healthy release has NO 5xx
+# series at all, so the bare sum() is an empty result, not 0, and an empty
+# numerator makes the whole ratio empty - failing the gate on exactly the
+# case it should pass. The denominator is deliberately left bare, so no
+# traffic at all is still an empty ratio and still fails closed.
+canary_query="(sum(rate(nginx_ingress_controller_requests{${CANARY_SELECTOR},status=~\"5..\"}[${WINDOW}])) or vector(0))
 /
 sum(rate(nginx_ingress_controller_requests{${CANARY_SELECTOR}}[${WINDOW}]))"
 
@@ -131,7 +136,7 @@ if awk -v a="${canary_raw}" -v b="${CANARY_THRESHOLD}" 'BEGIN { exit !(a > b) }'
 fi
 
 # -------------------------------------------------------- overall ratio
-overall_query="sum(rate(nginx_ingress_controller_requests{${BASE_SELECTOR},status=~\"5..\"}[${WINDOW}]))
+overall_query="(sum(rate(nginx_ingress_controller_requests{${BASE_SELECTOR},status=~\"5..\"}[${WINDOW}])) or vector(0))
 /
 sum(rate(nginx_ingress_controller_requests{${BASE_SELECTOR}}[${WINDOW}]))"
 
