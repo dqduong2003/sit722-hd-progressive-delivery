@@ -50,3 +50,27 @@ output "get_kubeconfig_command" {
   description = "Command to export the admin kubeconfig used to build the KUBE_CONFIG GitHub secret"
   value       = "az aks get-credentials --resource-group ${azurerm_resource_group.rg.name} --name ${azurerm_kubernetes_cluster.aks.name} --admin --file ./kubeconfig-admin"
 }
+
+#
+# HD task additions
+#
+
+output "ingress_nginx_namespace" {
+  description = "Namespace holding the ingress-nginx controller installed by Terraform"
+  value       = helm_release.ingress_nginx.namespace
+}
+
+output "ingress_nginx_chart_version" {
+  description = "Pinned ingress-nginx chart version actually deployed"
+  value       = helm_release.ingress_nginx.version
+}
+
+output "get_ingress_ip_command" {
+  description = "Command that returns the public IP of the ingress controller once Azure has assigned it"
+  value       = "kubectl get service ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}'"
+}
+
+output "user_service_ingress_host" {
+  description = "Host header that must be sent when calling user-service through the ingress"
+  value       = var.user_service_ingress_host
+}

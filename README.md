@@ -1,313 +1,99 @@
-# Week 08 – Continuous Delivery with GitHub Actions and Kubernetes
+# KoalaTech University — Progressive Delivery Pipeline
 
-In Week 07, we implemented a Continuous Integration (CI) pipeline using GitHub Actions. The pipeline automatically tested the backend services, built Docker images, and pushed the successfully built images to Azure Container Registry (ACR).
+SIT722 HD Task. The Week 07–10 CI/CD pipeline extended with **blue/green deployment**,
+**weighted canary traffic shifting**, and **automated rollback driven by live production
+metrics**.
 
-In Week 08, we extend this workflow to implement **Continuous Delivery (CD)**.
-
-The application will first be automatically deployed to a **staging environment**. After deployment, automated tests will verify that the staging application is working correctly. A tested version can then be manually promoted to the **production environment**.
-
-The same Docker images that are tested in staging are deployed to production. The application is **not rebuilt** during production deployment.
-
----
-
-## 1. Continuous Delivery Workflow
-
-The Week 08 pipeline consists of four GitHub Actions workflows:
-
-![](./workflow.png)
-
-The first three workflows run automatically.
-
-Production deployment is intentionally manual.
+**Setup and demonstration instructions: [`SETUP.md`](SETUP.md).**
+The accompanying report is `HD-Task-Documentation.md` in the parent `HDtask/` directory.
 
 ---
 
-# 2. Prepare the Infrastructure
+## What this does
 
-Create the Terraform infrastructure files using the same approach demonstrated in **Week 06**.
+The inherited pipeline deploys with `kubectl set image` and verifies with
+`kubectl rollout status`. That asks Kubernetes one question — *did the new pods start?* —
+and nothing about whether the release is any good. A fault that only appears under real
+traffic passes that gate every time.
 
-The infrastructure should provide the Azure resources required by the application, including the Kubernetes infrastructure, Azure Container Registry, and Azure Storage configuration used by the application.
+`user-service` is now released by a pipeline that:
 
-### Important AKS Change
+1. deploys the new image to an **idle slot** receiving no user traffic;
+2. **smoke-tests that slot directly**, while no user can reach it;
+3. admits real traffic in **weighted steps** — 10% → 50% → 100%;
+4. after each step, queries the **live HTTP 5xx rate at the edge** from Prometheus;
+5. **reverses the shift and restores the previous image automatically** if the error
+   rate breaches threshold, then fails the run.
 
-When creating the Kubernetes infrastructure, update the AKS node count to:
+No human is involved in step 5. The other five services keep the in-place rolling update
+from Week 08, deliberately, as the control case.
 
-```hcl
-node_count = 3
+## Architecture
+
+```
+                        ingress-nginx  (LoadBalancer)
+                                 |
+              host: koalatech.local   path: /api/users(/|$)(.*)
+                                 |
+        +------------------------+------------------------+
+        |                                                 |
+  Ingress user-service                      Ingress user-service-canary
+  rewrite-target: /$2                       canary: "true"
+                                            canary-weight: N
+        |                                                 |
+  Service user-service                      Service user-service-preview
+  selector: app=user-service                selector: app=user-service
+            slot=<LIVE>                               slot=<CANDIDATE>
+        |                                                 |
+  Deployment user-service-blue              Deployment user-service-green
 ```
 
-Three nodes are required for this practical because both the staging and production environments run persistent PostgreSQL database workloads.
-
-After running Terraform, verify that the AKS cluster contains three nodes:
-
-```bash
-kubectl get nodes
-```
-
----
-
-# 4. Fork the Repository
-
-Fork the provided Week 08 repository into your own GitHub account.
-
-Clone your fork:
-
-```bash
-git clone <YOUR-FORK-URL>
-```
-
-Move into the project:
-
-```bash
-cd week08
-```
-
-Ensure that your remote points to your fork:
-
-```bash
-git remote -v
-```
-
----
-
-# 5. Create Azure Service Principal
-
-GitHub Actions requires permission to interact with Azure.
-
-Create a Service Principal following the same process introduced previously.
-
-The Service Principal must have sufficient permissions to:
-
-* authenticate with Azure;
-* push Docker images to Azure Container Registry;
-* access the AKS cluster;
-* deploy Kubernetes workloads.
-
-Store the Service Principal credentials as a GitHub Repository Secret named:
-
-```text
-AZURE_CREDENTIALS
-```
-
-The value must use the following structure:
-
-```json
-{
-  "clientId": "YOUR_CLIENT_ID",
-  "clientSecret": "YOUR_CLIENT_SECRET",
-  "subscriptionId": "YOUR_SUBSCRIPTION_ID",
-  "tenantId": "YOUR_TENANT_ID"
-}
-```
-
-Do not commit these credentials to the repository.
-
----
-
-# 6. Configure GitHub Repository Variables
-
-Go to:
-
-```text
-GitHub Repository
-→ Settings
-→ Secrets and variables
-→ Actions
-→ Variables
-```
-
-Create the following **Repository Variables**.
-
-### ACR_NAME
-
-The name of your Azure Container Registry.
-
----
-
-### ACR_LOGIN_SERVER
-
-The complete ACR login server.
-
----
-
-### AKS_RESOURCE_GROUP
-
-The Resource Group containing your AKS cluster.
-
----
-
-### AKS_CLUSTER_NAME
-
-The name of your AKS cluster.
-
----
-
-# 7. Repository Secret
-
-Under:
-
-```text
-Settings
-→ Secrets and variables
-→ Actions
-→ Secrets
-```
-
-create:
-
-```text
-AZURE_CREDENTIALS
-```
-
-This contains the Service Principal authentication JSON.
-
----
-
-# 8. Create the Staging GitHub Environment
-
-Go to:
-
-```text
-GitHub Repository
-→ Settings
-→ Environments
-→ New environment
-```
-
-Create:
-
-```text
-staging
-```
-
-Add the following **Environment Secrets**:
-
-```text
-POSTGRES_USER = postgres
-POSTGRES_PASSWORD = postgres
-JWT_SECRET_KEY = koalatech-local-development-secret
-DEFAULT_ADMIN_USERNAME = admin
-DEFAULT_ADMIN_EMAIL = admin@koalatech.edu.au
-DEFAULT_ADMIN_PASSWORD = AdminPassword123!
-AZURE_STORAGE_CONNECTION_STRING = <YOUR_STORAGE_ACCOUNT_CONNECTION_STRING>
-```
----
-
-# 9. Create the Production GitHub Environment
-
-Create another environment:
-
-```text
-production
-```
-
-Add the same Environment Secret names:
-
-```text
-POSTGRES_USER = postgres
-POSTGRES_PASSWORD = postgres
-JWT_SECRET_KEY = koalatech-local-development-secret
-DEFAULT_ADMIN_USERNAME = admin
-DEFAULT_ADMIN_EMAIL = admin@koalatech.edu.au
-DEFAULT_ADMIN_PASSWORD = AdminPassword123!
-AZURE_STORAGE_CONNECTION_STRING = <YOUR_STORAGE_ACCOUNT_CONNECTION_STRING>
-```
-
-Staging and production therefore have independent environment configuration.
-
----
-
-# 10. GitHub Configuration Summary
-
-The final GitHub configuration should be:
-
-| Type                          | Name                              |
-| ----------------------------- | --------------------------------- |
-| Repository Secret             | `AZURE_CREDENTIALS`               |
-| Repository Variable           | `ACR_NAME`                        |
-| Repository Variable           | `ACR_LOGIN_SERVER`                |
-| Repository Variable           | `AKS_RESOURCE_GROUP`              |
-| Repository Variable           | `AKS_CLUSTER_NAME`                |
-| Staging Environment Secret    | `POSTGRES_USER`                   |
-| Staging Environment Secret    | `POSTGRES_PASSWORD`               |
-| Staging Environment Secret    | `JWT_SECRET_KEY`                  |
-| Staging Environment Secret    | `DEFAULT_ADMIN_USERNAME`          |
-| Staging Environment Secret    | `DEFAULT_ADMIN_EMAIL`             |
-| Staging Environment Secret    | `DEFAULT_ADMIN_PASSWORD`          |
-| Staging Environment Secret    | `AZURE_STORAGE_CONNECTION_STRING` |
-| Production Environment Secret | `POSTGRES_USER`                   |
-| Production Environment Secret | `POSTGRES_PASSWORD`               |
-| Production Environment Secret | `JWT_SECRET_KEY`                  |
-| Production Environment Secret | `DEFAULT_ADMIN_USERNAME`          |
-| Production Environment Secret | `DEFAULT_ADMIN_EMAIL`             |
-| Production Environment Secret | `DEFAULT_ADMIN_PASSWORD`          |
-| Production Environment Secret | `AZURE_STORAGE_CONNECTION_STRING` |
-
----
-
-# 11. GitHub Actions Workflows
-
-The repository contains four workflow files:
-
-```text
-.github/
-└── workflows/
-    ├── 01-ci.yml
-    ├── 02-deploy-staging.yml
-    ├── 03-staging-test.yml
-    └── 04-deploy-production.yml
-```
-
----
-
-# 12. Run and Verify the Staging Application
-
-Verify that the following workflows complete successfully:
-
-01 - CI
-02 - Deploy to Staging
-03 - Staging Test
-
-Once the deployment is complete, verify the Kubernetes resources in the staging namespace and access the staging application using the frontend external IP.
-
-Confirm that the application is working correctly before proceeding to production.
-
-13. Deploy to Production
-
-Production deployment is performed manually.
-
-Go to:
-
-GitHub Repository
-→ Actions
-→ 04 - Deploy to Production
-→ Run workflow
-
-Provide the image SHA that successfully passed the staging deployment and testing process.
-
-### Find the Image SHA
-
-Before running the production workflow, obtain the Git commit SHA of the version that was successfully deployed and tested in staging:
-
-```bash
-git rev-parse HEAD
-```
-
-Copy the returned SHA and provide it as the `image_tag` when manually running the **04 - Deploy to Production** workflow.
-
-> Make sure the SHA belongs to the version that successfully passed the staging pipeline.
-
-
-Run the production workflow and verify that it completes successfully.
-
-Important: Production must use the same image version that was tested in staging. Do not rebuild the Docker images for production.
-
-14. Verify the Production Application
-
-After the production deployment completes:
-
-- Verify the Kubernetes resources in the production namespace.
-- Find the external IP of the production frontend service.
-- Access the production application.
-- Confirm that the application is working correctly.
-- Verify that production is running the same image SHA that was tested in staging.
+The two middle Services name a **role**, not a slot: `user-service` means *whatever is
+live*, `user-service-preview` means *whatever is being released*. The Ingresses point at
+those names and are never modified — promotion is a swap of two selector values, so
+blue→green and green→blue are the same operation.
+
+## Workflows
+
+| Workflow | Trigger | Does |
+|---|---|---|
+| `01-ci.yml` | push to `main` | test → Docker Scout → push SHA-tagged images to ACR |
+| `02-deploy-staging.yml` | after `01` | deploy all services to `staging` |
+| `03-staging-test.yml` | after `02` | smoke-test staging |
+| `04-deploy-production.yml` | after `03` | rolling update of the **five** other services |
+| `05-terraform.yml` | `terraform/**` changes | `fmt` + `validate` (no cloud credentials needed) |
+| `06-deploy-monitoring.yml` | manual | install `kube-prometheus-stack` via Helm |
+| **`07-progressive-deploy.yml`** | after `04`, or manual | **owns the `user-service` release end to end** |
+
+## Layout
+
+| Path | Contents |
+|---|---|
+| `terraform/` | AKS, ACR, Storage, and `helm_release.ingress_nginx` |
+| `kubernetes/production/`, `kubernetes/staging/` | the five rolling-update services and databases |
+| `kubernetes/bluegreen/` | the blue/green slots, role-pinned Services, and Ingress pair |
+| `kubernetes/tools/` | the k6 load-generator and smoke-test Jobs |
+| `scripts/check-error-rate.sh` | **the rollback gate** — PromQL, fails closed |
+| `scripts/smoke-test-slot.sh` | pre-traffic verification of a slot |
+| `k6/rollout-load.js` | continuous load for the duration of a rollout |
+| `user-service/app/fault_injection.py` | fault injection for the rollback demonstration; inert by default |
+
+## Constraint worth knowing before you start
+
+This student Microsoft Entra tenant **blocks service-principal creation**. Consequently:
+
+- `azure/login` is unusable; all CI `kubectl` auth uses a base64 admin kubeconfig in the
+  `KUBE_CONFIG` secret, which works because `local_account_disabled = false`;
+- `terraform plan`/`apply` cannot run in CI and are run manually (`05` does
+  `fmt`/`validate` only);
+- the rollback gate queries the **in-cluster** Prometheus through the API server's
+  service proxy rather than Azure Monitor managed Prometheus, whose query API needs an
+  Entra token.
+
+## Known risk
+
+`ingress-nginx` was archived upstream in March 2026 and no longer receives security
+patches. The chart version is pinned explicitly in `terraform/ingress_nginx.tf` rather
+than floating. The migration path is the Gateway API, whose
+`HTTPRoute.spec.rules[].backendRefs[].weight` provides weighted routing as a first-class
+field. See §8 of `HD-Task-Documentation.md`.

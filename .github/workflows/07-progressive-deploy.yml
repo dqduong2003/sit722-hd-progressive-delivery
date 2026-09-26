@@ -1,0 +1,698 @@
+name: 07 - Progressive Deploy (Blue/Green)
+
+# Progressive delivery for user-service, with automated rollback driven by the
+# service's own live error rate.
+#
+# Where this sits relative to the rest of the pipeline:
+#
+#   01 - CI                  build, test, scan, push to ACR
+#   02 / 03                  deploy staging, smoke-test it
+#   04 - Deploy Production   in-place rolling update of the other 5 components
+#   07 - THIS WORKFLOW       owns the user-service release end to end
+#
+# Workflows 02 and 04 deploy by mutating a running Deployment with
+# `kubectl set image` and then waiting on `kubectl rollout status`. That asks
+# Kubernetes exactly one question - did the new pods start? - and nothing at
+# all about whether the release is any good. A fault that only appears under
+# real traffic passes that gate every single time.
+#
+# This workflow replaces that with four things the course has not covered:
+#
+#   1. Deploy to an IDLE slot, so a bad build harms nobody on arrival.
+#   2. Verify that slot directly, while no user can reach it.
+#   3. Admit real traffic in WEIGHTED steps, not all at once.
+#   4. After each step, consult the LIVE error rate at the edge and reverse
+#      the shift automatically if it rises.
+#
+# Point 4 is the substantive one: the rollback trigger is production telemetry
+# from the running system, not a test result computed before release.
+
+on:
+  workflow_run:
+    workflows:
+      - "04 - Deploy to Production"
+    types:
+      - completed
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag (commit SHA) to release. Defaults to the triggering commit."
+        required: false
+        type: string
+      fault_injection:
+        description: "Inject a fault into the candidate, to demonstrate automated rollback."
+        required: false
+        default: "off"
+        type: choice
+        options:
+          - "off"
+          - "immediate"
+          - "delayed:150"
+      canary_steps:
+        description: "Comma-separated canary weights to step through."
+        required: false
+        default: "10,50,100"
+        type: string
+
+env:
+  NAMESPACE: production
+  INGRESS_HOST: koalatech.local
+  INGRESS_URL: http://ingress-nginx-controller.ingress-nginx.svc.cluster.local/api/users/
+  # Each weight is held long enough for the gate's rate() window to be filled
+  # with data from AFTER the shift. Hold for less than the window and the gate
+  # is partly judging the previous step's traffic.
+  SETTLE_SECONDS: "100"
+
+jobs:
+  # =====================================================================
+  prepare:
+    name: Resolve release state
+    runs-on: ubuntu-latest
+
+    # Only run for a successful upstream deployment; a dispatch has no
+    # workflow_run context and always proceeds.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+
+    environment:
+      name: production
+
+    outputs:
+      image_tag: ${{ steps.slots.outputs.image_tag }}
+      active_slot: ${{ steps.slots.outputs.active_slot }}
+      candidate_slot: ${{ steps.slots.outputs.candidate_slot }}
+      candidate_previous_image: ${{ steps.slots.outputs.candidate_previous_image }}
+      bootstrapped: ${{ steps.slots.outputs.bootstrapped }}
+
+    steps:
+      - name: Checkout released commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      # Certificate-based admin kubeconfig from a repository secret
+      # (a student Entra tenant blocks the service principal `azure/login` needs).
+      - name: Configure kubectl (admin kubeconfig)
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl config current-context
+
+      - name: Verify the ingress controller is present and routable
+        run: |
+          set -euo pipefail
+
+          # Provisioned by Terraform (terraform/ingress_nginx.tf), not by this
+          # workflow. The pipeline cannot shift traffic if the component that
+          # shifts traffic is missing, so this is a precondition, not a step.
+          if ! kubectl get deployment ingress-nginx-controller -n ingress-nginx >/dev/null 2>&1; then
+            echo "::error::ingress-nginx is not installed. Run 'terraform apply' - see SETUP.md."
+            exit 1
+          fi
+
+          # Azure takes a minute or two to assign the public IP, so this polls
+          # rather than reading once.
+          for i in $(seq 1 30); do
+            IP=$(kubectl get service ingress-nginx-controller -n ingress-nginx \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+
+            if [ -n "$IP" ]; then
+              echo "::notice::Ingress controller reachable at $IP"
+              exit 0
+            fi
+
+            echo "Waiting for the ingress LoadBalancer IP..."
+            sleep 10
+          done
+
+          echo "::error::Ingress LoadBalancer IP was never assigned."
+          exit 1
+
+      - name: Verify Prometheus is scraping the ingress controller
+        run: |
+          set -euo pipefail
+
+          # Checked up front because the rollback gate fails closed. If the
+          # metrics path is broken it is far better to find out here than to
+          # discover it as a spurious rollback with a release half shifted.
+          TARGETS=$(kubectl get --raw \
+            "/api/v1/namespaces/monitoring/services/prometheus-kube-prometheus-prometheus:9090/proxy/api/v1/targets" \
+            | jq '[.data.activeTargets[] | select((.labels.job // "") | test("ingress-nginx")) | select(.health == "up")] | length')
+
+          echo "Healthy ingress-nginx scrape targets: ${TARGETS:-0}"
+
+          if [ "${TARGETS:-0}" -lt 1 ]; then
+            echo "::error::Prometheus is not scraping ingress-nginx. Check controller.metrics.enabled and that the ServiceMonitor carries label release=prometheus (terraform/ingress_nginx.tf)."
+            exit 1
+          fi
+
+      - name: Bootstrap or reconcile the blue/green topology
+        id: slots
+        run: |
+          set -euo pipefail
+
+          TAG="${{ inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.event.workflow_run.head_sha || github.sha }}"
+          fi
+
+          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:$TAG"
+          echo "Releasing $IMAGE"
+
+          if kubectl get deployment user-service-blue -n "$NAMESPACE" >/dev/null 2>&1; then
+            BOOTSTRAPPED=false
+          else
+            BOOTSTRAPPED=true
+          fi
+
+          if [ "$BOOTSTRAPPED" = "true" ]; then
+            echo "First run - creating both slots on $IMAGE."
+
+            for SLOT in blue green; do
+              sed "s|image: placeholder|image: $IMAGE|" \
+                kubernetes/bluegreen/*-user-service-$SLOT.yaml | kubectl apply -f -
+            done
+
+            # The routing Services carry mutable state (which slot is live), so
+            # this manifest is applied ONCE and never again. A blind re-apply
+            # would reset the live slot to blue and silently undo a promotion.
+            kubectl apply -f kubernetes/bluegreen/03-user-service-routing.yaml
+
+            for SLOT in blue green; do
+              kubectl rollout status deployment/user-service-$SLOT \
+                -n "$NAMESPACE" --timeout=300s
+            done
+
+            ACTIVE=blue
+          else
+            ACTIVE=$(kubectl get service user-service -n "$NAMESPACE" \
+              -o jsonpath='{.spec.selector.slot}')
+
+            if [ -z "$ACTIVE" ]; then
+              echo "::error::Service/user-service has no slot selector - the blue/green topology is in an unexpected state."
+              exit 1
+            fi
+
+            # Re-apply the LIVE slot's manifest with the image it is already
+            # running, so edits to probes or resources propagate without the
+            # apply resetting a running release to `placeholder`.
+            LIVE_IMAGE=$(kubectl get deployment user-service-$ACTIVE -n "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+            sed "s|image: placeholder|image: $LIVE_IMAGE|" \
+              kubernetes/bluegreen/*-user-service-$ACTIVE.yaml | kubectl apply -f -
+          fi
+
+          # The Ingresses hold no per-release state, so applying them every run
+          # is safe and resets canary-weight to a known 0 before any shift.
+          kubectl apply -f kubernetes/bluegreen/04-user-service-ingress.yaml
+
+          if [ "$ACTIVE" = "blue" ]; then
+            CANDIDATE=green
+          else
+            CANDIDATE=blue
+          fi
+
+          # Recorded now so the rollback job knows what to restore. The cluster
+          # is the single source of truth for release state - there is no
+          # external store that could drift out of sync with reality.
+          PREV_IMAGE=$(kubectl get deployment user-service-$CANDIDATE -n "$NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+          # The preview Service must always select the candidate slot.
+          kubectl patch service user-service-preview -n "$NAMESPACE" \
+            -p "{\"spec\":{\"selector\":{\"app\":\"user-service\",\"slot\":\"$CANDIDATE\"}}}"
+
+          {
+            echo "image_tag=$TAG"
+            echo "active_slot=$ACTIVE"
+            echo "candidate_slot=$CANDIDATE"
+            echo "candidate_previous_image=$PREV_IMAGE"
+            echo "bootstrapped=$BOOTSTRAPPED"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "::notice::Live slot: $ACTIVE. Releasing into: $CANDIDATE."
+
+      - name: Summarise the release plan
+        run: |
+          {
+            echo "### Progressive deployment plan"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Image tag | \`${{ steps.slots.outputs.image_tag }}\` |"
+            echo "| Live slot | \`${{ steps.slots.outputs.active_slot }}\` |"
+            echo "| Candidate slot | \`${{ steps.slots.outputs.candidate_slot }}\` |"
+            echo "| Candidate rollback image | \`${{ steps.slots.outputs.candidate_previous_image }}\` |"
+            echo "| Canary steps | \`${{ inputs.canary_steps || '10,50,100' }}\` |"
+            echo "| Fault injection | \`${{ inputs.fault_injection || 'off' }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # =====================================================================
+  deploy-candidate:
+    name: Deploy to the idle slot
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout released commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Configure kubectl (admin kubeconfig)
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Deploy the new image to the idle slot
+        env:
+          CANDIDATE: ${{ needs.prepare.outputs.candidate_slot }}
+          TAG: ${{ needs.prepare.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:$TAG"
+
+          # This Deployment currently receives no user traffic whatsoever: the
+          # stable Service selects the other slot and canary-weight is 0. A
+          # total failure here is invisible to users.
+          sed "s|image: placeholder|image: $IMAGE|" \
+            kubernetes/bluegreen/*-user-service-$CANDIDATE.yaml | kubectl apply -f -
+
+          echo "Deployed $IMAGE into slot $CANDIDATE."
+
+      - name: Apply the fault-injection setting
+        env:
+          CANDIDATE: ${{ needs.prepare.outputs.candidate_slot }}
+          MODE: ${{ inputs.fault_injection || 'off' }}
+        run: |
+          # Demonstration control only; `off` on every normal release.
+          kubectl set env deployment/user-service-$CANDIDATE \
+            FAULT_INJECTION_MODE="$MODE" -n "$NAMESPACE"
+
+          if [ "$MODE" != "off" ]; then
+            echo "::warning::Fault injection ENABLED on the candidate (mode=$MODE). This run is a rollback demonstration."
+          fi
+
+      - name: Wait for the candidate to become ready
+        env:
+          CANDIDATE: ${{ needs.prepare.outputs.candidate_slot }}
+        run: |
+          set -euo pipefail
+
+          # The readiness probe added in kubernetes/bluegreen/ is what makes
+          # this wait mean anything. Without probes - as in Weeks 05-10 -
+          # rollout status returns as soon as the container process exists.
+          kubectl rollout status deployment/user-service-$CANDIDATE \
+            -n "$NAMESPACE" --timeout=300s
+
+          echo "::group::user-service pods"
+          kubectl get pods -n "$NAMESPACE" -l app=user-service --show-labels
+          echo "::endgroup::"
+
+  # =====================================================================
+  smoke-test-candidate:
+    name: Smoke test the idle slot
+    needs: [prepare, deploy-candidate]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout released commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Configure kubectl (admin kubeconfig)
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Run the smoke test against the candidate only
+        env:
+          CANDIDATE: ${{ needs.prepare.outputs.candidate_slot }}
+        run: |
+          set -euo pipefail
+
+          kubectl delete job smoke-test-$CANDIDATE -n "$NAMESPACE" --ignore-not-found
+
+          kubectl create configmap smoke-test-script \
+            --namespace "$NAMESPACE" \
+            --from-file=smoke-test-slot.sh=scripts/smoke-test-slot.sh \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          sed "s|SLOT_PLACEHOLDER|$CANDIDATE|g" \
+            kubernetes/tools/smoke-test-job.yaml | kubectl apply -f -
+
+          # Poll for either outcome rather than `kubectl wait`, which can only
+          # wait for one condition at a time: waiting on `complete` alone would
+          # block for the whole timeout when the test fails, and waiting on
+          # `failed` alone would do the same when it passes.
+          RESULT=""
+          DEADLINE=$((SECONDS + 240))
+
+          while [ "$SECONDS" -lt "$DEADLINE" ]; do
+            SUCCEEDED=$(kubectl get job smoke-test-$CANDIDATE -n "$NAMESPACE" \
+              -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
+            FAILED=$(kubectl get job smoke-test-$CANDIDATE -n "$NAMESPACE" \
+              -o jsonpath='{.status.failed}' 2>/dev/null || echo "")
+
+            if [ "${SUCCEEDED:-0}" -ge 1 ] 2>/dev/null; then
+              RESULT=pass
+              break
+            fi
+
+            if [ "${FAILED:-0}" -ge 1 ] 2>/dev/null; then
+              RESULT=fail
+              break
+            fi
+
+            sleep 5
+          done
+
+          echo "::group::Smoke test output"
+          kubectl logs job/smoke-test-$CANDIDATE -n "$NAMESPACE" --tail=100 || true
+          echo "::endgroup::"
+
+          kubectl delete job smoke-test-$CANDIDATE -n "$NAMESPACE" --ignore-not-found
+
+          if [ "$RESULT" = "fail" ]; then
+            echo "::error::Smoke test failed on the candidate slot. No user traffic was ever routed to it."
+            exit 1
+          fi
+
+          if [ -z "$RESULT" ]; then
+            # Timing out is not a pass. Fail closed, exactly as the metric
+            # gate does.
+            echo "::error::Smoke test did not finish within the timeout. Failing closed."
+            exit 1
+          fi
+
+          echo "::notice::Candidate passed pre-traffic verification."
+
+  # =====================================================================
+  progressive-shift:
+    name: Shift traffic and watch the error rate
+    needs: [prepare, deploy-candidate, smoke-test-candidate]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout released commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Configure kubectl (admin kubeconfig)
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Start the in-cluster load generator
+        run: |
+          set -euo pipefail
+
+          kubectl delete job k6-rollout-load -n "$NAMESPACE" --ignore-not-found
+
+          kubectl create configmap k6-rollout-script \
+            --namespace "$NAMESPACE" \
+            --from-file=rollout-load.js=k6/rollout-load.js \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl apply -f kubernetes/tools/k6-job.yaml
+
+          kubectl wait --for=condition=ready pod \
+            -l app=k6-rollout-load -n "$NAMESPACE" --timeout=180s
+
+          # Traffic has to be flowing BEFORE the first weight change, or the
+          # gate's rate() window would be partly filled with the period before
+          # the candidate was reachable at all.
+          echo "Priming the metric window..."
+          sleep 45
+
+      - name: Shift traffic in weighted steps
+        env:
+          STEPS: ${{ inputs.canary_steps || '10,50,100' }}
+        run: |
+          set -euo pipefail
+
+          IFS=',' read -ra WEIGHTS <<< "$STEPS"
+
+          for RAW_WEIGHT in "${WEIGHTS[@]}"; do
+            WEIGHT=$(echo "$RAW_WEIGHT" | tr -d '[:space:]')
+
+            echo "::group::Canary weight -> ${WEIGHT}%"
+
+            # The single value that controls what fraction of real requests
+            # reach the new version. A Service cannot express this; only a
+            # layer that understands HTTP can.
+            kubectl annotate ingress user-service-canary -n "$NAMESPACE" \
+              nginx.ingress.kubernetes.io/canary-weight="$WEIGHT" --overwrite
+
+            kubectl get ingress user-service-canary -n "$NAMESPACE" \
+              -o jsonpath='{.metadata.annotations}'
+            echo
+
+            echo "Holding ${WEIGHT}% for ${SETTLE_SECONDS}s before evaluating..."
+            sleep "$SETTLE_SECONDS"
+
+            # THE GATE. Exits non-zero on breach, failing this job and
+            # triggering the rollback job below. Nothing here asks a human.
+            bash scripts/check-error-rate.sh
+
+            echo "::notice::Canary weight ${WEIGHT}% held the error-rate gate."
+            echo "::endgroup::"
+          done
+
+      - name: Report load generator progress
+        if: always()
+        run: |
+          kubectl logs job/k6-rollout-load -n "$NAMESPACE" --tail=60 || true
+
+  # =====================================================================
+  promote:
+    name: Promote the candidate to live
+    needs: [prepare, deploy-candidate, smoke-test-candidate, progressive-shift]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+
+    steps:
+      - name: Configure kubectl (admin kubeconfig)
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Swap the slots
+        env:
+          ACTIVE: ${{ needs.prepare.outputs.active_slot }}
+          CANDIDATE: ${{ needs.prepare.outputs.candidate_slot }}
+        run: |
+          set -euo pipefail
+
+          # The candidate has been serving 100% of edge traffic through the
+          # canary upstream and held the error rate. Promotion makes that the
+          # normal path: the stable Service now selects the candidate, so
+          # traffic no longer depends on a canary annotation, and in-cluster
+          # callers resolving `user-service` follow in the same instant.
+          kubectl patch service user-service -n "$NAMESPACE" \
+            -p "{\"spec\":{\"selector\":{\"app\":\"user-service\",\"slot\":\"$CANDIDATE\"}}}"
+
+          # The previously live slot becomes the next deployment target, and
+          # the rollback destination for the release after this one.
+          kubectl patch service user-service-preview -n "$NAMESPACE" \
+            -p "{\"spec\":{\"selector\":{\"app\":\"user-service\",\"slot\":\"$ACTIVE\"}}}"
+
+          # Back to a clean baseline for the next release.
+          kubectl annotate ingress user-service-canary -n "$NAMESPACE" \
+            nginx.ingress.kubernetes.io/canary-weight=0 --overwrite
+
+          # Note what does NOT happen here: the old slot is not scaled to zero.
+          # An alternative upstream with no ready endpoints makes the
+          # controller log errors continuously, and keeping the previous
+          # version warm is what makes the next rollback instant.
+          echo "::notice::Promoted $CANDIDATE to live. $ACTIVE is now the idle slot, still running."
+
+      - name: Verify live traffic is served by the promoted slot
+        env:
+          CANDIDATE: ${{ needs.prepare.outputs.candidate_slot }}
+        run: |
+          set -euo pipefail
+
+          SELECTOR=$(kubectl get service user-service -n "$NAMESPACE" \
+            -o jsonpath='{.spec.selector.slot}')
+
+          if [ "$SELECTOR" != "$CANDIDATE" ]; then
+            echo "::error::Stable Service selects '$SELECTOR', expected '$CANDIDATE'."
+            exit 1
+          fi
+
+          kubectl run promote-verify-${GITHUB_RUN_ID} \
+            --namespace "$NAMESPACE" \
+            --image=curlimages/curl:latest \
+            --restart=Never --rm --attach --quiet \
+            --command -- curl --silent --show-error --fail --max-time 10 \
+              -H "Host: ${INGRESS_HOST}" "${INGRESS_URL}"
+
+      - name: Stop the load generator and record evidence
+        if: always()
+        run: |
+          echo "::group::Load generator summary"
+          kubectl logs job/k6-rollout-load -n "$NAMESPACE" --tail=40 || true
+          echo "::endgroup::"
+
+          kubectl delete job k6-rollout-load -n "$NAMESPACE" --ignore-not-found
+
+          {
+            echo "### Release promoted"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Live slot | \`${{ needs.prepare.outputs.candidate_slot }}\` |"
+            echo "| Idle slot (kept warm for rollback) | \`${{ needs.prepare.outputs.active_slot }}\` |"
+            echo "| Image tag | \`${{ needs.prepare.outputs.image_tag }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # =====================================================================
+  rollback:
+    name: Automated rollback
+    needs: [prepare, deploy-candidate, smoke-test-candidate, progressive-shift, promote]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+
+    # Fires when any stage above failed: a smoke test that failed before
+    # traffic shifted, a breached error-rate gate after it, or a failed
+    # promotion. `prepare` must have succeeded, because its outputs are what
+    # tell this job what to undo.
+    if: ${{ always() && failure() && needs.prepare.result == 'success' }}
+
+    steps:
+      - name: Configure kubectl (admin kubeconfig)
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Stop sending traffic to the candidate
+        run: |
+          # FIRST, and on its own. This is the action that stops user-visible
+          # harm; it takes effect within seconds and depends on nothing else
+          # succeeding. Restoring images can happen afterwards, at leisure.
+          kubectl annotate ingress user-service-canary -n "$NAMESPACE" \
+            nginx.ingress.kubernetes.io/canary-weight=0 --overwrite
+
+          echo "::warning::Canary weight set to 0 - all traffic is served by the live slot."
+
+      - name: Confirm the live slot is intact
+        env:
+          ACTIVE: ${{ needs.prepare.outputs.active_slot }}
+        run: |
+          set -euo pipefail
+
+          SELECTOR=$(kubectl get service user-service -n "$NAMESPACE" \
+            -o jsonpath='{.spec.selector.slot}')
+
+          echo "Stable Service selects slot: $SELECTOR"
+
+          if [ "$SELECTOR" != "$ACTIVE" ]; then
+            # Only reachable if promotion itself failed part-way through. Put
+            # the stable Service back on the slot that was known good.
+            echo "::warning::Stable Service had moved to '$SELECTOR'; restoring '$ACTIVE'."
+
+            kubectl patch service user-service -n "$NAMESPACE" \
+              -p "{\"spec\":{\"selector\":{\"app\":\"user-service\",\"slot\":\"$ACTIVE\"}}}"
+          fi
+
+          kubectl rollout status deployment/user-service-$ACTIVE \
+            -n "$NAMESPACE" --timeout=180s
+
+      - name: Restore the previous image on the candidate slot
+        env:
+          CANDIDATE: ${{ needs.prepare.outputs.candidate_slot }}
+          PREV_IMAGE: ${{ needs.prepare.outputs.candidate_previous_image }}
+        run: |
+          set -euo pipefail
+
+          # The candidate slot is returned to the state the pipeline found it
+          # in, so the next release starts from a known baseline rather than
+          # from a known-bad image.
+          #
+          # It is NOT scaled to zero: an alternative upstream with no ready
+          # endpoints makes ingress-nginx log `no alternative balancer for
+          # backend` continuously, and a warm slot keeps the next rollback
+          # fast.
+          kubectl set env deployment/user-service-$CANDIDATE \
+            FAULT_INJECTION_MODE=off -n "$NAMESPACE"
+
+          kubectl set image deployment/user-service-$CANDIDATE \
+            user-service="$PREV_IMAGE" -n "$NAMESPACE"
+
+          kubectl rollout status deployment/user-service-$CANDIDATE \
+            -n "$NAMESPACE" --timeout=300s
+
+          echo "Candidate slot restored to $PREV_IMAGE."
+
+      - name: Verify production has recovered
+        run: |
+          set -euo pipefail
+
+          kubectl run rollback-verify-${GITHUB_RUN_ID} \
+            --namespace "$NAMESPACE" \
+            --image=curlimages/curl:latest \
+            --restart=Never --rm --attach --quiet \
+            --command -- sh -c "i=0; while [ \$i -lt 10 ]; do curl --silent --show-error --fail --max-time 10 -H 'Host: ${INGRESS_HOST}' '${INGRESS_URL}' > /dev/null || exit 1; i=\$((i+1)); done; echo '10/10 requests succeeded after rollback'"
+
+      - name: Record rollback evidence
+        if: always()
+        run: |
+          echo "::group::Ingress canary state"
+          kubectl get ingress user-service-canary -n "$NAMESPACE" \
+            -o jsonpath='{.metadata.annotations}' || true
+          echo
+          echo "::endgroup::"
+
+          echo "::group::Candidate pod logs (fault-injection markers)"
+          kubectl logs -n "$NAMESPACE" \
+            -l app=user-service,slot=${{ needs.prepare.outputs.candidate_slot }} \
+            --tail=50 --prefix || true
+          echo "::endgroup::"
+
+          echo "::group::Load generator summary"
+          kubectl logs job/k6-rollout-load -n "$NAMESPACE" --tail=40 || true
+          echo "::endgroup::"
+
+          kubectl delete job k6-rollout-load -n "$NAMESPACE" --ignore-not-found
+
+          {
+            echo "### Automated rollback executed"
+            echo ""
+            echo "Production was left on the last known-good version. No human intervened."
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Live slot (unchanged throughout) | \`${{ needs.prepare.outputs.active_slot }}\` |"
+            echo "| Rejected candidate slot | \`${{ needs.prepare.outputs.candidate_slot }}\` |"
+            echo "| Rejected image tag | \`${{ needs.prepare.outputs.image_tag }}\` |"
+            echo "| Candidate restored to | \`${{ needs.prepare.outputs.candidate_previous_image }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the run
+        run: |
+          # The rollback succeeded, but the RELEASE did not. The run must be
+          # red so the outcome is visible and this commit is not recorded as
+          # having shipped.
+          echo "::error::Release rolled back automatically - the candidate did not meet the error-rate gate."
+          exit 1

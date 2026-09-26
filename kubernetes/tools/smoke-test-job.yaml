@@ -1,0 +1,57 @@
+#
+# Smoke test for a freshly deployed slot, before it receives any user traffic.
+#
+# Run as a Job inside the cluster so it can address the slot-pinned Service
+# (user-service-blue / user-service-green) directly. Those are ClusterIP
+# Services with no external route, which is precisely the property that makes
+# this test safe: the slot is testable without being reachable by anyone else.
+#
+# The admin credentials come from the `application-secret` already present in
+# the namespace, so no GitHub secret has to be marshalled into the pod.
+#
+# SLOT_PLACEHOLDER is substituted by 07-progressive-deploy.yml before this is
+# applied, because the slot under test alternates between releases.
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: smoke-test-SLOT_PLACEHOLDER
+  namespace: production
+  labels:
+    app: smoke-test
+    slot: SLOT_PLACEHOLDER
+spec:
+  # A smoke test that fails must fail the release, not quietly succeed on a
+  # retry that hides an intermittent fault.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: smoke-test
+        slot: SLOT_PLACEHOLDER
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: smoke-test
+          image: curlimages/curl:latest
+          command: ["sh", "/scripts/smoke-test-slot.sh"]
+          env:
+            - name: BASE_URL
+              value: http://user-service-SLOT_PLACEHOLDER:8000
+            - name: DEFAULT_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: DEFAULT_ADMIN_USERNAME
+            - name: DEFAULT_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: DEFAULT_ADMIN_PASSWORD
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+      volumes:
+        - name: script
+          configMap:
+            name: smoke-test-script

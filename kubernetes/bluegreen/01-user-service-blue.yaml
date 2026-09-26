@@ -1,0 +1,145 @@
+#
+# user-service, blue slot.
+#
+# Weeks 05-10 ran a single `user-service` Deployment that was mutated in
+# place by `kubectl set image`. That makes the old version unrecoverable
+# except through ReplicaSet history, and it offers no way to test a new
+# version under real conditions before users reach it.
+#
+# Here two identical Deployments exist permanently. One is live, the other
+# is idle and available as a deployment target. The `slot` label is the new
+# selector dimension that makes them addressable independently - the
+# application label `app: user-service` still matches both, so anything
+# selecting on it alone sees the service as a whole.
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service-blue
+  namespace: production
+  labels:
+    app: user-service
+    slot: blue
+spec:
+  # Held at 1 for the demonstration so an injected fault produces a clean
+  # step change in the error rate rather than a ramp across pods that arm
+  # their fault timers independently.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: user-service
+      slot: blue
+  template:
+    metadata:
+      labels:
+        app: user-service
+        slot: blue
+    spec:
+      containers:
+        - name: user-service
+          image: placeholder
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          #
+          # No application Deployment in Weeks 05-10 had probes, which meant
+          # `kubectl rollout status` reported success as soon as the
+          # container process started - it proved nothing about the app.
+          #
+          # These probes are a necessary precondition for blue/green: the
+          # pipeline must be able to tell that the idle slot is actually
+          # serving before it sends traffic to it.
+          #
+          # Note the limitation, which is exactly why the metric gate exists:
+          # /health returns a static 200 and never touches the database, so a
+          # passing probe means "the process is up", not "the release is
+          # good". Probes cannot catch a fault that only appears under real
+          # traffic.
+          #
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          env:
+            #
+            # Inert unless the pipeline sets it. Used only to demonstrate
+            # automated rollback against a latent fault; see
+            # user-service/app/fault_injection.py.
+            #
+            - name: FAULT_INJECTION_MODE
+              value: "off"
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: users
+            - name: POSTGRES_HOST
+              value: user-db
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: JWT_SECRET_KEY
+            - name: JWT_ALGORITHM
+              value: HS256
+            - name: ACCESS_TOKEN_EXPIRE_MINUTES
+              value: "30"
+            - name: DEFAULT_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: DEFAULT_ADMIN_USERNAME
+            - name: DEFAULT_ADMIN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: DEFAULT_ADMIN_EMAIL
+            - name: DEFAULT_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: DEFAULT_ADMIN_PASSWORD
+
+---
+#
+# Slot-pinned Service. Addresses blue specifically, regardless of which
+# slot is currently live. The pipeline uses this to smoke-test a freshly
+# deployed slot directly, before any user traffic is routed to it.
+#
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service-blue
+  namespace: production
+  labels:
+    app: user-service
+    slot: blue
+spec:
+  type: ClusterIP
+  selector:
+    app: user-service
+    slot: blue
+  ports:
+    - port: 8000
+      targetPort: 8000
