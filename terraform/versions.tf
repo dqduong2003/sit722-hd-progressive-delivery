@@ -29,8 +29,11 @@ provider "azurerm" {
 
 #
 # Both the Helm and Kubernetes providers authenticate with the cluster's
-# certificate-based *admin* credentials (`kube_admin_config`), which exist
-# only because `kubernetes_service.tf` sets `local_account_disabled = false`.
+# certificate-based *admin* credentials (`kube_config`). Local accounts are
+# enabled (`local_account_disabled = false` in `kubernetes_service.tf`) and
+# Azure AD RBAC is not configured, so `kube_config` carries the admin client
+# certificate. (`kube_admin_config` is only populated when AAD RBAC is on,
+# and is empty here.)
 #
 # That is the same constraint that shapes the whole pipeline: this student
 # Entra tenant blocks service-principal creation, so neither Terraform nor
@@ -43,24 +46,33 @@ provider "azurerm" {
 # unknown at plan time, so the cluster must be created first:
 #
 #   terraform apply -target=azurerm_kubernetes_cluster.aks
+#   <install kube-prometheus-stack - see the note below>
 #   terraform apply
 #
-# This two-stage sequence is documented in SETUP.md. It is a known and
-# still-current limitation of provider configuration in Terraform, not a
-# defect in this configuration.
+# This is a known and still-current limitation of provider configuration in
+# Terraform, not a defect in this configuration. On PowerShell, quote the
+# target so the dot is not split: -target="azurerm_kubernetes_cluster.aks".
+#
+# Between the two stages, install kube-prometheus-stack (the same Helm release
+# that workflow 06 installs). The ingress release below creates a
+# ServiceMonitor, and that CRD ships with kube-prometheus-stack - without it
+# stage 2 fails with `no matches for kind "ServiceMonitor"`:
+#
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm upgrade --install prometheus prometheus-community/kube-prometheus-stack --namespace monitoring --create-namespace --wait
 #
 provider "helm" {
   kubernetes = {
-    host                   = azurerm_kubernetes_cluster.aks.kube_admin_config[0].host
-    client_certificate     = base64decode(azurerm_kubernetes_cluster.aks.kube_admin_config[0].client_certificate)
-    client_key             = base64decode(azurerm_kubernetes_cluster.aks.kube_admin_config[0].client_key)
-    cluster_ca_certificate = base64decode(azurerm_kubernetes_cluster.aks.kube_admin_config[0].cluster_ca_certificate)
+    host                   = azurerm_kubernetes_cluster.aks.kube_config[0].host
+    client_certificate     = base64decode(azurerm_kubernetes_cluster.aks.kube_config[0].client_certificate)
+    client_key             = base64decode(azurerm_kubernetes_cluster.aks.kube_config[0].client_key)
+    cluster_ca_certificate = base64decode(azurerm_kubernetes_cluster.aks.kube_config[0].cluster_ca_certificate)
   }
 }
 
 provider "kubernetes" {
-  host                   = azurerm_kubernetes_cluster.aks.kube_admin_config[0].host
-  client_certificate     = base64decode(azurerm_kubernetes_cluster.aks.kube_admin_config[0].client_certificate)
-  client_key             = base64decode(azurerm_kubernetes_cluster.aks.kube_admin_config[0].client_key)
-  cluster_ca_certificate = base64decode(azurerm_kubernetes_cluster.aks.kube_admin_config[0].cluster_ca_certificate)
+  host                   = azurerm_kubernetes_cluster.aks.kube_config[0].host
+  client_certificate     = base64decode(azurerm_kubernetes_cluster.aks.kube_config[0].client_certificate)
+  client_key             = base64decode(azurerm_kubernetes_cluster.aks.kube_config[0].client_key)
+  cluster_ca_certificate = base64decode(azurerm_kubernetes_cluster.aks.kube_config[0].cluster_ca_certificate)
 }
